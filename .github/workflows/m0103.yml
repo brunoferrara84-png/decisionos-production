@@ -6,6 +6,7 @@ on:
 jobs:
   repair:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -18,48 +19,36 @@ jobs:
       - name: Verify frozen inputs
         run: |
           test -s DecisionOS_NVIDIA_VISUAL_APPROVED_BASELINE.mp4
-          curl --fail --location --retry 3 \
-            "https://res.cloudinary.com/uhdjssyk/video/upload/v1788623215/decisionos/m010_3/nvidia_fresh_marco_santini.mp3" \
-            --output marco_santini.mp3
+          curl --fail --location --retry 3             "https://res.cloudinary.com/uhdjssyk/video/upload/v1788623215/decisionos/m010_3/nvidia_fresh_marco_santini.mp3"             --output marco_santini.mp3
           test -s marco_santini.mp3
+
+      - name: Create semantic retiming filter
+        run: |
+          cat > filter.txt <<'EOF'
+          [0:v]trim=start=0:end=13.8,setpts=(PTS-STARTPTS)*9.58/13.8[v0];
+          [0:v]trim=start=13.8:end=25.5,setpts=(PTS-STARTPTS)*11.24/11.7[v1];
+          [0:v]trim=start=25.5:end=42.6,setpts=(PTS-STARTPTS)*7.26/17.1[v2];
+          [0:v]trim=start=42.6:end=55.8,setpts=(PTS-STARTPTS)*11.94/13.2[v3];
+          [0:v]trim=start=55.8:end=71.3,setpts=(PTS-STARTPTS)*13.00/15.5[v4];
+          [0:v]trim=start=71.3:end=86.2,setpts=(PTS-STARTPTS)*8.48/14.9[v5];
+          [0:v]trim=start=86.2:end=97.541667,setpts=(PTS-STARTPTS)*7.95/11.341667[v6];
+          [v0][v1][v2][v3][v4][v5][v6]concat=n=7:v=1:a=0,fps=24,format=yuv420p[v]
+          EOF
 
       - name: Restore approved visual and retime by semantic boundaries
         run: |
           mkdir -p output
-
-          ffmpeg -y -i DecisionOS_NVIDIA_VISUAL_APPROVED_BASELINE.mp4 \
-            -filter_complex "\
-[0:v]trim=start=0:end=13.8,setpts=(PTS-STARTPTS)*9.58/13.8[v0];\
-[0:v]trim=start=13.8:end=25.5,setpts=(PTS-STARTPTS)*11.24/11.7[v1];\
-[0:v]trim=start=25.5:end=42.6,setpts=(PTS-STARTPTS)*7.26/17.1[v2];\
-[0:v]trim=start=42.6:end=55.8,setpts=(PTS-STARTPTS)*11.94/13.2[v3];\
-[0:v]trim=start=55.8:end=71.3,setpts=(PTS-STARTPTS)*13.00/15.5[v4];\
-[0:v]trim=start=71.3:end=86.2,setpts=(PTS-STARTPTS)*8.48/14.9[v5];\
-[0:v]trim=start=86.2:end=97.541667,setpts=(PTS-STARTPTS)*7.95/11.341667[v6];\
-[v0][v1][v2][v3][v4][v5][v6]concat=n=7:v=1:a=0,fps=24,format=yuv420p[v]" \
-            -map "[v]" -an \
-            -c:v libx264 -preset slow -crf 10 \
-            -movflags +faststart \
-            output/DecisionOS_NVIDIA_VISUAL_RESTORED_SYNC_REPAIR.mp4
+          ffmpeg -y             -i DecisionOS_NVIDIA_VISUAL_APPROVED_BASELINE.mp4             -filter_complex_script filter.txt             -map "[v]"             -an             -c:v libx264             -preset slow             -crf 10             -movflags +faststart             output/DecisionOS_NVIDIA_VISUAL_RESTORED_SYNC_REPAIR.mp4
 
       - name: Assemble Founder-approved voice
         run: |
-          ffmpeg -y \
-            -i output/DecisionOS_NVIDIA_VISUAL_RESTORED_SYNC_REPAIR.mp4 \
-            -i marco_santini.mp3 \
-            -map 0:v:0 -map 1:a:0 \
-            -c:v copy -c:a aac -b:a 192k -ar 48000 \
-            -t 69.48 -movflags +faststart \
-            output/DecisionOS_NVIDIA_HuggingFace_M0103_REPAIR_003.mp4
+          ffmpeg -y             -i output/DecisionOS_NVIDIA_VISUAL_RESTORED_SYNC_REPAIR.mp4             -i marco_santini.mp3             -map 0:v:0             -map 1:a:0             -c:v copy             -c:a aac             -b:a 192k             -ar 48000             -t 69.48             -movflags +faststart             output/DecisionOS_NVIDIA_HuggingFace_M0103_REPAIR_003.mp4
 
       - name: Actual-artifact technical QA
         run: |
           test -s output/DecisionOS_NVIDIA_HuggingFace_M0103_REPAIR_003.mp4
-          ffprobe -v error \
-            -show_entries format=duration,size \
-            -show_entries stream=index,codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels \
-            -of default=noprint_wrappers=1 \
-            output/DecisionOS_NVIDIA_HuggingFace_M0103_REPAIR_003.mp4
+          ffprobe -v error             -show_entries format=duration,size             -show_entries stream=index,codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels             -of default=noprint_wrappers=1             output/DecisionOS_NVIDIA_HuggingFace_M0103_REPAIR_003.mp4
+
           test "$(ffprobe -v error -select_streams v -show_entries stream=index -of csv=p=0 output/DecisionOS_NVIDIA_HuggingFace_M0103_REPAIR_003.mp4 | wc -l)" -ge 1
           test "$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 output/DecisionOS_NVIDIA_HuggingFace_M0103_REPAIR_003.mp4 | wc -l)" -ge 1
 
