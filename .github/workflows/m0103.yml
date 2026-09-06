@@ -1,34 +1,54 @@
-name: M010.3 Zero-Founder-Reupload Smoke Test
+name: M010.3 Zero-Founder-Reupload AV Replay
 
 on:
   workflow_dispatch:
 
 jobs:
-  render:
+  build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          sudo apt-get install -y ffmpeg fonts-inter fonts-dejavu-core
           python -m pip install --upgrade pip
           pip install pillow
-      - name: Render controlled replay visual
+
+      - name: Render DecisionOS visual
         run: python renderer.py
-      - name: Verify output
+
+      - name: Download Founder-approved Marco Santini witness
         run: |
-          test -f output/DecisionOS_M0103_NVIDIA_VISUAL_SMOKE_TEST.mp4
-          ffprobe -v error -show_entries format=duration -show_entries stream=codec_name,width,height,r_frame_rate -of default=noprint_wrappers=1 output/DecisionOS_M0103_NVIDIA_VISUAL_SMOKE_TEST.mp4
-      - name: Upload rendered artifact
+          curl --fail --location --retry 3             "https://res.cloudinary.com/uhdjssyk/video/upload/v1788623215/decisionos/m010_3/nvidia_fresh_marco_santini.mp3"             --output output/marco_santini.mp3
+
+      - name: Assemble synchronized audiovisual candidate
+        run: |
+          ffmpeg -y             -i output/DecisionOS_M0103_NVIDIA_VISUAL_V2.mp4             -i output/marco_santini.mp3             -filter_complex "[1:a]apad=pad_dur=1[a]"             -map 0:v:0 -map "[a]"             -c:v copy -c:a aac -b:a 160k             -t 70.0 -movflags +faststart             output/DecisionOS_NVIDIA_HuggingFace_M0103_AV_CANDIDATE.mp4
+
+      - name: Actual-artifact technical QA
+        run: |
+          test -s output/DecisionOS_NVIDIA_HuggingFace_M0103_AV_CANDIDATE.mp4
+          ffprobe -v error             -show_entries format=duration             -show_entries stream=index,codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels             -of default=noprint_wrappers=1             output/DecisionOS_NVIDIA_HuggingFace_M0103_AV_CANDIDATE.mp4
+
+          VIDEO_STREAMS=$(ffprobe -v error -select_streams v -show_entries stream=index -of csv=p=0 output/DecisionOS_NVIDIA_HuggingFace_M0103_AV_CANDIDATE.mp4 | wc -l)
+          AUDIO_STREAMS=$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 output/DecisionOS_NVIDIA_HuggingFace_M0103_AV_CANDIDATE.mp4 | wc -l)
+          test "$VIDEO_STREAMS" -ge 1
+          test "$AUDIO_STREAMS" -ge 1
+
+      - name: Upload final candidate artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DecisionOS-M0103-NVIDIA-Visual-Smoke-Test
-          path: output/DecisionOS_M0103_NVIDIA_VISUAL_SMOKE_TEST.mp4
+          name: DecisionOS-M0103-NVIDIA-AV-Candidate
+          path: output/DecisionOS_NVIDIA_HuggingFace_M0103_AV_CANDIDATE.mp4
           if-no-files-found: error
           retention-days: 7
+          
