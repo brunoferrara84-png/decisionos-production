@@ -1,0 +1,300 @@
+name: DecisionOS Chatterbox Voice Renderer
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  voice-renderer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+
+      - name: Fetch latest DecisionOS voice job
+        id: job
+        shell: bash
+        run: |
+          mkdir -p work
+
+          URL="https://res.cloudinary.com/uhdjssyk/raw/upload/decisionos/m010_4/voice_job_latest"
+
+          HTTP_CODE=$(curl \
+            --silent \
+            --show-error \
+            --location \
+            --output work/job.json \
+            --write-out "%{http_code}" \
+            "${URL}?nocache=$(date +%s)")
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "No active DecisionOS voice job."
+            echo "has_job=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          JOB_ID=$(python - <<'PY'
+          import json
+
+          with open("work/job.json", encoding="utf-8") as f:
+              job = json.load(f)
+
+          print(job.get("job_id", ""))
+          PY
+          )
+
+          if [ -z "$JOB_ID" ]; then
+            echo "No valid DecisionOS job_id."
+            echo "has_job=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "has_job=true" >> "$GITHUB_OUTPUT"
+          echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
+          echo "DecisionOS voice job: $JOB_ID"
+
+      - name: Prepare processed-job cache
+        if: steps.job.outputs.has_job == 'true'
+        run: mkdir -p .decisionos_processed
+
+      - name: Check whether job was already processed
+        if: steps.job.outputs.has_job == 'true'
+        id: processed
+        uses: actions/cache@v4
+        with:
+          path: .decisionos_processed
+          key: decisionos-voice-${{ steps.job.outputs.job_id }}
+
+      - name: Set up Python
+        if: >
+          steps.job.outputs.has_job == 'true' &&
+          steps.processed.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install FFmpeg
+        if: >
+          steps.job.outputs.has_job == 'true' &&
+          steps.processed.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Chatterbox
+        if: >
+          steps.job.outputs.has_job == 'true' &&
+          steps.processed.outputs.cache-hit != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install chatterbox-tts
+
+      - name: Render DecisionOS voice
+        if: >
+          steps.job.outputs.has_job == 'true' &&
+          steps.processed.outputs.cache-hit != 'true'
+        env:
+          JOB_ID: ${{ steps.job.outputs.job_id }}
+        run: |
+          cat > work/render.py <<'PY'
+          import json
+          import random
+          import re
+          from pathlib import Path
+
+          import numpy as np
+          import torch
+          import torchaudio as ta
+          from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+
+
+          def set_seed(seed):
+              torch.manual_seed(seed)
+
+              if torch.cuda.is_available():
+                  torch.cuda.manual_seed(seed)
+                  torch.cuda.manual_seed_all(seed)
+
+              random.seed(seed)
+              np.random.seed(seed)
+
+
+          def split_text(text, max_chars=260):
+              sentences = re.split(r'(?<=[.!?;:])\s+', text.strip())
+
+              chunks = []
+              current = ""
+
+              for sentence in sentences:
+                  candidate = (
+                      sentence
+                      if not current
+                      else current + " " + sentence
+                  )
+
+                  if len(candidate) <= max_chars:
+                      current = candidate
+                  else:
+                      if current:
+                          chunks.append(current)
+
+                      if len(sentence) <= max_chars:
+                          current = sentence
+                      else:
+                          words = sentence.split()
+                          current = ""
+
+                          for word in words:
+                              candidate = (
+                                  word
+                                  if not current
+                                  else current + " " + word
+                              )
+
+                              if len(candidate) <= max_chars:
+                                  current = candidate
+                              else:
+                                  chunks.append(current)
+                                  current = word
+
+              if current:
+                  chunks.append(current)
+
+              return chunks
+
+
+          with open("work/job.json", encoding="utf-8") as f:
+              job = json.load(f)
+
+          job_id = job["job_id"]
+          text = job["text"]
+          language_id = job.get("language_id", "it")
+
+          seed = int(job.get("seed", 271828))
+          exaggeration = float(job.get("exaggeration", 0.5))
+          cfg_weight = float(job.get("cfg_weight", 0.5))
+          temperature = float(job.get("temperature", 0.8))
+
+          device = (
+              "cuda"
+              if torch.cuda.is_available()
+              else "cpu"
+          )
+
+          print("Device:", device)
+          print("Loading Chatterbox Multilingual V3...")
+
+          model = ChatterboxMultilingualTTS.from_pretrained(
+              device=device,
+              t3_model="v3"
+          )
+
+          chunks = split_text(text)
+
+          if not chunks:
+              raise RuntimeError("Empty TTS text.")
+
+          rendered = []
+
+          for index, chunk in enumerate(chunks):
+              print(
+                  f"Rendering chunk "
+                  f"{index + 1}/{len(chunks)}"
+              )
+
+              set_seed(seed + index)
+
+              wav = model.generate(
+                  chunk,
+                  language_id=language_id,
+                  exaggeration=exaggeration,
+                  cfg_weight=cfg_weight,
+                  temperature=temperature
+              )
+
+              rendered.append(wav)
+
+              if index < len(chunks) - 1:
+                  silence_samples = int(model.sr * 0.18)
+                  silence = torch.zeros(
+                      (1, silence_samples),
+                      dtype=wav.dtype,
+                      device=wav.device
+                  )
+                  rendered.append(silence)
+
+          final_wav = torch.cat(rendered, dim=1)
+
+          Path("voice_output").mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+          output = (
+              Path("voice_output") /
+              f"{job_id}.wav"
+          )
+
+          ta.save(
+              str(output),
+              final_wav.cpu(),
+              model.sr
+          )
+
+          if (
+              not output.exists()
+              or output.stat().st_size == 0
+          ):
+              raise RuntimeError(
+                  "No valid WAV generated."
+              )
+
+          print("VOICE_RENDER_PASS:", output)
+          PY
+
+          python work/render.py
+
+      - name: Technical audio QA
+        if: >
+          steps.job.outputs.has_job == 'true' &&
+          steps.processed.outputs.cache-hit != 'true'
+        run: |
+          WAV_FILE=$(find voice_output \
+            -type f \
+            -name '*.wav' \
+            | head -n 1)
+
+          test -n "$WAV_FILE"
+          test -s "$WAV_FILE"
+
+          ffprobe \
+            -v error \
+            -show_entries format=duration,size \
+            -show_entries \
+            stream=codec_type,codec_name,sample_rate,channels \
+            -of default=noprint_wrappers=1 \
+            "$WAV_FILE"
+
+      - name: Upload DecisionOS voice artifact
+        if: >
+          steps.job.outputs.has_job == 'true' &&
+          steps.processed.outputs.cache-hit != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DecisionOS-Voice-${{ steps.job.outputs.job_id }}
+          path: voice_output/*.wav
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Mark job processed
+        if: >
+          success() &&
+          steps.job.outputs.has_job == 'true' &&
+          steps.processed.outputs.cache-hit != 'true'
+        run: |
+          touch \
+            ".decisionos_processed/${{ steps.job.outputs.job_id }}"
