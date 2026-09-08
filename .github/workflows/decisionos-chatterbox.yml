@@ -189,9 +189,10 @@ jobs:
           print("Loading Chatterbox Multilingual V3...")
 
           model = ChatterboxMultilingualTTS.from_pretrained(
-              device=device,
-              t3_model="v3"
+              device=device
           )
+
+          kwargs = {
 
           chunks = split_text(text)
 
