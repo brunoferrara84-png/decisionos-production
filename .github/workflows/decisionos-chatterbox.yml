@@ -192,8 +192,6 @@ jobs:
               device=device
           )
 
-          kwargs = {
-
           chunks = split_text(text)
 
           if not chunks:
