@@ -1,0 +1,153 @@
+name: DecisionOS Chatterbox Voice Renderer
+
+on:
+  push:
+    paths:
+      - 'voice_jobs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  render-voice:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout DecisionOS production
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Chatterbox
+        run: |
+          python -m pip install --upgrade pip
+          pip install chatterbox-tts
+
+      - name: Locate voice job
+        id: job
+        shell: bash
+        run: |
+          JOB_FILE=$(find voice_jobs -maxdepth 1 -type f -name '*.json' | sort | tail -n 1)
+
+          if [ -z "$JOB_FILE" ]; then
+            echo "No DecisionOS voice job found."
+            exit 1
+          fi
+
+          echo "job_file=$JOB_FILE" >> "$GITHUB_OUTPUT"
+          echo "Using job: $JOB_FILE"
+
+      - name: Render DecisionOS voice with Chatterbox Multilingual V3
+        env:
+          JOB_FILE: ${{ steps.job.outputs.job_file }}
+        run: |
+          cat > /tmp/render_voice.py <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          import torch
+          import torchaudio as ta
+          from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+
+          job_path = Path(os.environ["JOB_FILE"])
+
+          with job_path.open("r", encoding="utf-8") as f:
+              job = json.load(f)
+
+          required = [
+              "job_id",
+              "text",
+              "language_id",
+              "audio_prompt_path"
+          ]
+
+          missing = [key for key in required if not job.get(key)]
+          if missing:
+              raise RuntimeError(
+                  "Missing required job fields: " + ", ".join(missing)
+              )
+
+          prompt_path = Path(job["audio_prompt_path"])
+          if not prompt_path.is_file():
+              raise FileNotFoundError(
+                  f"Approved voice reference not found: {prompt_path}"
+              )
+
+          output_dir = Path("voice_output")
+          output_dir.mkdir(parents=True, exist_ok=True)
+
+          output_path = output_dir / f'{job["job_id"]}.wav'
+
+          device = "cuda" if torch.cuda.is_available() else "cpu"
+          print(f"DecisionOS Chatterbox device: {device}")
+          print("Loading Chatterbox Multilingual V3...")
+
+          model = ChatterboxMultilingualTTS.from_pretrained(
+              device=device,
+              t3_model="v3"
+          )
+
+          kwargs = {
+              "language_id": job["language_id"],
+              "audio_prompt_path": str(prompt_path),
+          }
+
+          if "exaggeration" in job:
+              kwargs["exaggeration"] = float(job["exaggeration"])
+
+          if "cfg_weight" in job:
+              kwargs["cfg_weight"] = float(job["cfg_weight"])
+
+          if "temperature" in job:
+              kwargs["temperature"] = float(job["temperature"])
+
+          wav = model.generate(
+              job["text"],
+              **kwargs
+          )
+
+          ta.save(
+              str(output_path),
+              wav,
+              model.sr
+          )
+
+          if not output_path.is_file() or output_path.stat().st_size == 0:
+              raise RuntimeError("Voice renderer produced no valid WAV.")
+
+          print(f"VOICE_RENDER_PASS={output_path}")
+          PY
+
+          python /tmp/render_voice.py
+
+      - name: Technical audio QA
+        run: |
+          WAV_FILE=$(find voice_output -type f -name '*.wav' | head -n 1)
+
+          test -n "$WAV_FILE"
+          test -s "$WAV_FILE"
+
+          ffprobe -v error \
+            -show_entries format=duration,size \
+            -show_entries stream=codec_type,codec_name,sample_rate,channels \
+            -of default=noprint_wrappers=1 \
+            "$WAV_FILE"
+
+      - name: Upload DecisionOS voice artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DecisionOS-Chatterbox-Voice
+          path: voice_output/*.wav
+          if-no-files-found: error
+          retention-days: 7
