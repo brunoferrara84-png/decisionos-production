@@ -39,10 +39,8 @@ jobs:
 
           JOB_ID=$(python - <<'PY'
           import json
-
           with open("work/job.json", encoding="utf-8") as f:
               job = json.load(f)
-
           print(job.get("job_id", ""))
           PY
           )
@@ -57,17 +55,13 @@ jobs:
           echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
           echo "DecisionOS voice job: $JOB_ID"
 
-      - name: Prepare processed-job cache
-        if: steps.job.outputs.has_job == 'true'
-        run: mkdir -p .decisionos_processed
-
       - name: Check whether job was already processed
         if: steps.job.outputs.has_job == 'true'
         id: processed
         uses: actions/cache@v4
         with:
-          path: .decisionos_processed
-          key: decisionos-voice-${{ steps.job.outputs.job_id }}
+          path: .decisionos_processed/${{ steps.job.outputs.job_id }}
+          key: decisionos-voice-v2-${{ steps.job.outputs.job_id }}
 
       - name: Set up Python
         if: >
@@ -111,61 +105,40 @@ jobs:
           import torchaudio as ta
           from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
-
           def set_seed(seed):
               torch.manual_seed(seed)
-
               if torch.cuda.is_available():
                   torch.cuda.manual_seed(seed)
                   torch.cuda.manual_seed_all(seed)
-
               random.seed(seed)
               np.random.seed(seed)
 
-
           def split_text(text, max_chars=260):
               sentences = re.split(r'(?<=[.!?;:])\s+', text.strip())
-
               chunks = []
               current = ""
-
               for sentence in sentences:
-                  candidate = (
-                      sentence
-                      if not current
-                      else current + " " + sentence
-                  )
-
+                  candidate = sentence if not current else current + " " + sentence
                   if len(candidate) <= max_chars:
                       current = candidate
                   else:
                       if current:
                           chunks.append(current)
-
                       if len(sentence) <= max_chars:
                           current = sentence
                       else:
                           words = sentence.split()
                           current = ""
-
                           for word in words:
-                              candidate = (
-                                  word
-                                  if not current
-                                  else current + " " + word
-                              )
-
+                              candidate = word if not current else current + " " + word
                               if len(candidate) <= max_chars:
                                   current = candidate
                               else:
                                   chunks.append(current)
                                   current = word
-
               if current:
                   chunks.append(current)
-
               return chunks
-
 
           with open("work/job.json", encoding="utf-8") as f:
               job = json.load(f)
@@ -173,25 +146,16 @@ jobs:
           job_id = job["job_id"]
           text = job["text"]
           language_id = job.get("language_id", "it")
-
           seed = int(job.get("seed", 271828))
           exaggeration = float(job.get("exaggeration", 0.5))
           cfg_weight = float(job.get("cfg_weight", 0.5))
           temperature = float(job.get("temperature", 0.8))
 
-          device = (
-              "cuda"
-              if torch.cuda.is_available()
-              else "cpu"
-          )
-
+          device = "cuda" if torch.cuda.is_available() else "cpu"
           print("Device:", device)
           print("Loading Chatterbox Multilingual V3...")
 
-          model = ChatterboxMultilingualTTS.from_pretrained(
-              device=device
-          )
-
+          model = ChatterboxMultilingualTTS.from_pretrained(device=device)
           chunks = split_text(text)
 
           if not chunks:
@@ -200,13 +164,8 @@ jobs:
           rendered = []
 
           for index, chunk in enumerate(chunks):
-              print(
-                  f"Rendering chunk "
-                  f"{index + 1}/{len(chunks)}"
-              )
-
+              print(f"Rendering chunk {index + 1}/{len(chunks)}")
               set_seed(seed + index)
-
               wav = model.generate(
                   chunk,
                   language_id=language_id,
@@ -214,7 +173,6 @@ jobs:
                   cfg_weight=cfg_weight,
                   temperature=temperature
               )
-
               rendered.append(wav)
 
               if index < len(chunks) - 1:
@@ -228,29 +186,13 @@ jobs:
 
           final_wav = torch.cat(rendered, dim=1)
 
-          Path("voice_output").mkdir(
-              parents=True,
-              exist_ok=True
-          )
+          Path("voice_output").mkdir(parents=True, exist_ok=True)
+          output = Path("voice_output") / f"{job_id}.wav"
 
-          output = (
-              Path("voice_output") /
-              f"{job_id}.wav"
-          )
+          ta.save(str(output), final_wav.cpu(), model.sr)
 
-          ta.save(
-              str(output),
-              final_wav.cpu(),
-              model.sr
-          )
-
-          if (
-              not output.exists()
-              or output.stat().st_size == 0
-          ):
-              raise RuntimeError(
-                  "No valid WAV generated."
-              )
+          if not output.exists() or output.stat().st_size == 0:
+              raise RuntimeError("No valid WAV generated.")
 
           print("VOICE_RENDER_PASS:", output)
           PY
@@ -262,10 +204,7 @@ jobs:
           steps.job.outputs.has_job == 'true' &&
           steps.processed.outputs.cache-hit != 'true'
         run: |
-          WAV_FILE=$(find voice_output \
-            -type f \
-            -name '*.wav' \
-            | head -n 1)
+          WAV_FILE=$(find voice_output -type f -name '*.wav' | head -n 1)
 
           test -n "$WAV_FILE"
           test -s "$WAV_FILE"
@@ -273,8 +212,7 @@ jobs:
           ffprobe \
             -v error \
             -show_entries format=duration,size \
-            -show_entries \
-            stream=codec_type,codec_name,sample_rate,channels \
+            -show_entries stream=codec_type,codec_name,sample_rate,channels \
             -of default=noprint_wrappers=1 \
             "$WAV_FILE"
 
@@ -295,5 +233,5 @@ jobs:
           steps.job.outputs.has_job == 'true' &&
           steps.processed.outputs.cache-hit != 'true'
         run: |
-          touch \
-            ".decisionos_processed/${{ steps.job.outputs.job_id }}"
+          mkdir -p .decisionos_processed
+          touch ".decisionos_processed/${{ steps.job.outputs.job_id }}"
