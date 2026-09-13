@@ -58,10 +58,10 @@ jobs:
       - name: Check whether job was already processed
         if: steps.job.outputs.has_job == 'true'
         id: processed
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .decisionos_processed/${{ steps.job.outputs.job_id }}
-          key: decisionos-voice-v2-${{ steps.job.outputs.job_id }}
+          key: decisionos-voice-v3-${{ steps.job.outputs.job_id }}
 
       - name: Set up Python
         if: >
@@ -233,5 +233,15 @@ jobs:
           steps.job.outputs.has_job == 'true' &&
           steps.processed.outputs.cache-hit != 'true'
         run: |
-          mkdir -p .decisionos_processed
-          touch ".decisionos_processed/${{ steps.job.outputs.job_id }}"
+          mkdir -p ".decisionos_processed/${{ steps.job.outputs.job_id }}"
+          printf '%s\n' "artifact_uploaded=true" > ".decisionos_processed/${{ steps.job.outputs.job_id }}/status.txt"
+
+      - name: Save processed-job cache only after successful artifact upload
+        if: >
+          success() &&
+          steps.job.outputs.has_job == 'true' &&
+          steps.processed.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .decisionos_processed/${{ steps.job.outputs.job_id }}
+          key: decisionos-voice-v3-${{ steps.job.outputs.job_id }}
