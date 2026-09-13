@@ -1,0 +1,153 @@
+name: DecisionOS Production Video Worker
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  production-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Fetch latest DecisionOS production job
+        id: job
+        shell: bash
+        run: |
+          mkdir -p work output scenes
+          URL="https://res.cloudinary.com/uhdjssyk/raw/upload/decisionos/m010_5/production_job_latest"
+          CODE=$(curl -sS -L -o work/job.json -w "%{http_code}" "${URL}?nocache=$(date +%s)")
+          if [ "$CODE" != "200" ]; then echo "has_job=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          JOB_ID=$(python3 -c 'import json; print(json.load(open("work/job.json"))["job_id"])')
+          echo "has_job=true" >> "$GITHUB_OUTPUT"
+          echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
+          echo "Production job: $JOB_ID"
+
+      - name: Install video dependencies
+        if: steps.job.outputs.has_job == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-inter unzip
+          python3 -m pip install --upgrade pillow
+          fc-match Inter
+
+      - name: Recover approved Primark voice artifact
+        if: steps.job.outputs.has_job == 'true'
+        run: |
+          VOICE_URL=$(python3 -c 'import json; print(json.load(open("work/job.json"))["voice_zip_url"])')
+          curl -fL "$VOICE_URL" -o work/voice.zip
+          unzip -o work/voice.zip -d work/voice
+          WAV=$(find work/voice -type f -name '*.wav' | head -1)
+          test -s "$WAV"
+          cp "$WAV" work/voice.wav
+          ffprobe -v error -show_entries format=duration -of default=nw=1 work/voice.wav
+
+      - name: Render native 1080x1920 DecisionOS scenes
+        if: steps.job.outputs.has_job == 'true'
+        run: |
+          cat > work/render_scenes.py <<'PY'
+          import json
+          from pathlib import Path
+          from PIL import Image, ImageDraw, ImageFont
+          W,H=1080,1920
+          GRAPHITE='#0F1114'; OFFWHITE='#F2F2F2'; LIME='#C6FF00'; GRAY500='#6B6F76'; GRAY700='#2A2D31'
+          FONT='/usr/share/fonts/truetype/inter/Inter-Regular.otf'
+          BOLD='/usr/share/fonts/truetype/inter/Inter-Bold.otf'
+          if not Path(FONT).exists():
+              m=list(Path('/usr/share/fonts').rglob('Inter-Regular.*'))
+              if m: FONT=str(m[0])
+          if not Path(BOLD).exists():
+              m=list(Path('/usr/share/fonts').rglob('Inter-Bold.*'))
+              if m: BOLD=str(m[0])
+          if not Path(FONT).exists() or not Path(BOLD).exists(): raise RuntimeError('Inter font unavailable')
+          def f(size,b=False): return ImageFont.truetype(BOLD if b else FONT,size)
+          def wrap(draw,text,font,maxw):
+              out=[]; line=''
+              for word in text.split():
+                  t=word if not line else line+' '+word
+                  if draw.textbbox((0,0),t,font=font)[2] <= maxw: line=t
+                  else:
+                      if line: out.append(line)
+                      line=word
+              if line: out.append(line)
+              return out
+          def lines(draw,text,font,x,y,maxw,fill,gap=1.18):
+              for line in wrap(draw,text,font,maxw):
+                  draw.text((x,y),line,font=font,fill=fill); y += int(font.size*gap)
+              return y
+          job=json.load(open('work/job.json',encoding='utf-8'))
+          if not job.get('brand_identity_resolved'): raise RuntimeError('Brand Identity not resolved')
+          scenes=job['scenes']; bounds=job['scene_boundaries']
+          if len(bounds)!=len(scenes)+1: raise RuntimeError('Scene boundary mismatch')
+          for i,s in enumerate(scenes,1):
+              im=Image.new('RGB',(W,H),GRAPHITE); d=ImageDraw.Draw(im)
+              d.text((90,115),s['eyebrow'],font=f(28,True),fill=LIME)
+              d.line((90,185,990,185),fill=GRAY700,width=2)
+              y=285
+              y=lines(d,s['title'],f(72,True),90,y,900,OFFWHITE,1.12)
+              if s.get('accent'):
+                  y+=55; y=lines(d,s['accent'],f(45,True),90,y,880,LIME,1.18)
+              if s.get('body'):
+                  y+=70; y=lines(d,s['body'],f(38),90,y,880,OFFWHITE,1.38)
+              for m in s.get('metrics',[]):
+                  y+=70; d.text((90,y),m['value'],font=f(86,True),fill=LIME); y+=110
+                  y=lines(d,m['label'],f(30),90,y,850,GRAY500,1.28)
+              d.line((90,1700,990,1700),fill=GRAY700,width=2)
+              d.text((90,1740),'DECISIONOS',font=f(26,True),fill=OFFWHITE)
+              d.text((90,1780),'BETTER BUSINESS DECISIONS',font=f(20,True),fill=LIME)
+              d.text((930,1740),f'{i:02d}',font=f(22),fill=GRAY500)
+              out=Path('scenes')/f'scene_{i:02d}.png'; im.save(out)
+              if im.size!=(1080,1920): raise RuntimeError('Non-native scene')
+          print('VISUAL_RENDER_PASS',len(scenes))
+          PY
+          python3 work/render_scenes.py
+
+      - name: Assemble sentence-safe MP4
+        if: steps.job.outputs.has_job == 'true'
+        run: |
+          python3 - <<'PY'
+          import json
+          j=json.load(open('work/job.json')); b=j['scene_boundaries']
+          with open('work/concat.txt','w') as f:
+              for i in range(len(j['scenes'])):
+                  f.write(f"file '../scenes/scene_{i+1:02d}.png'\n")
+                  f.write(f"duration {b[i+1]-b[i]:.3f}\n")
+              f.write(f"file '../scenes/scene_{len(j['scenes']):02d}.png'\n")
+          PY
+          ffmpeg -y -f concat -safe 0 -i work/concat.txt -i work/voice.wav \
+            -vf "fps=30,format=yuv420p" -c:v libx264 -preset medium -crf 18 \
+            -c:a aac -b:a 192k -ar 48000 -movflags +faststart -shortest \
+            "output/${{ steps.job.outputs.job_id }}.mp4"
+
+      - name: Actual MP4 technical QA
+        if: steps.job.outputs.has_job == 'true'
+        run: |
+          MP4="output/${{ steps.job.outputs.job_id }}.mp4"
+          test -s "$MP4"
+          ffprobe -v error -show_entries stream=codec_type,codec_name,width,height,sample_rate,channels -show_entries format=duration,size -of json "$MP4" | tee output/technical_qa.json
+          python3 - <<'PY'
+          import json,subprocess
+          j=json.load(open('work/job.json')); p='output/'+j['job_id']+'.mp4'
+          x=json.loads(subprocess.check_output(['ffprobe','-v','error','-show_streams','-show_format','-of','json',p]))
+          v=next(s for s in x['streams'] if s['codec_type']=='video'); a=next(s for s in x['streams'] if s['codec_type']=='audio')
+          assert v['codec_name']=='h264' and int(v['width'])==1080 and int(v['height'])==1920
+          assert a['codec_name']=='aac'
+          dur=float(x['format']['duration']); target=float(j['audio_duration'])
+          assert abs(dur-target)<0.35, (dur,target)
+          print('MP4_TECHNICAL_QA_PASS',dur)
+          PY
+
+      - name: Upload DecisionOS mobile video artifact
+        if: steps.job.outputs.has_job == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DecisionOS-Production-${{ steps.job.outputs.job_id }}
+          path: |
+            output/*.mp4
+            output/technical_qa.json
+            scenes/*.png
+          if-no-files-found: error
+          retention-days: 7
