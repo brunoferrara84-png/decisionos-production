@@ -28,8 +28,23 @@ jobs:
           fi
           JOB_ID=$(python - <<'PY'
           import json
-          with open("work/job.json", encoding="utf-8") as f:
-              job = json.load(f)
+          import sys
+          from pathlib import Path
+
+          path = Path("work/job.json")
+          raw = path.read_text(encoding="utf-8")
+          try:
+              job = json.loads(raw)
+          except json.JSONDecodeError as exc:
+              # Cloudinary raw payloads can occasionally contain literal control
+              # characters inside string values. JSON permits escaped forms only.
+              # Replace literal C0 controls with spaces; escaped sequences (\n, \t)
+              # are ordinary printable characters here and remain unchanged.
+              sanitized = ''.join(' ' if ord(ch) < 32 else ch for ch in raw)
+              job = json.loads(sanitized)
+              path.write_text(json.dumps(job, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+              print(f"JOB_JSON_SANITIZED original_error={exc}", file=sys.stderr)
+
           print(job.get("job_id", ""))
           PY
           )
