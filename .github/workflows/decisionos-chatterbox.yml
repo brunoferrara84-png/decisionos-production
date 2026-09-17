@@ -8,16 +8,22 @@ on:
 permissions:
   contents: read
 
+# Never let two scheduled polls render the same mailbox concurrently.
+concurrency:
+  group: decisionos-chatterbox-voice
+  cancel-in-progress: false
+
 jobs:
   voice-renderer:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 60
 
     steps:
       - name: Fetch latest DecisionOS voice job
         id: job
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p work voice_output
           URL="https://res.cloudinary.com/uhdjssyk/raw/upload/decisionos/m010_4/voice_job_latest"
           HTTP_CODE=$(curl --silent --show-error --location --output work/job.json --write-out "%{http_code}" "${URL}?nocache=$(date +%s)")
@@ -26,6 +32,7 @@ jobs:
             echo "has_job=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
           JOB_ID=$(python - <<'PY'
           import json
           import sys
@@ -36,23 +43,26 @@ jobs:
           try:
               job = json.loads(raw)
           except json.JSONDecodeError as exc:
-              # Cloudinary raw payloads can occasionally contain literal control
-              # characters inside string values. JSON permits escaped forms only.
-              # Replace literal C0 controls with spaces; escaped sequences (\n, \t)
-              # are ordinary printable characters here and remain unchanged.
+              # Defensive ingress recovery only. Normalize literal C0 controls,
+              # then immediately reserialize as strict standards-compliant JSON.
               sanitized = ''.join(' ' if ord(ch) < 32 else ch for ch in raw)
               job = json.loads(sanitized)
-              path.write_text(json.dumps(job, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+              path.write_text(
+                  json.dumps(job, ensure_ascii=False, separators=(",", ":")),
+                  encoding="utf-8"
+              )
               print(f"JOB_JSON_SANITIZED original_error={exc}", file=sys.stderr)
 
           print(job.get("job_id", ""))
           PY
           )
+
           if [ -z "$JOB_ID" ]; then
             echo "No valid DecisionOS job_id."
             echo "has_job=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
           echo "has_job=true" >> "$GITHUB_OUTPUT"
           echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
           echo "DecisionOS voice job: $JOB_ID"
@@ -66,35 +76,37 @@ jobs:
       - name: Install voice dependencies
         if: steps.job.outputs.has_job == 'true'
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y ffmpeg
           python -m pip install --upgrade pip
-          pip install chatterbox-tts faster-whisper
+          # Chatterbox and Whisper are invoked in DIFFERENT Python processes.
+          # They are never resident in RAM at the same time.
+          pip install chatterbox-tts faster-whisper num2words
 
-      - name: Render scene-locked DecisionOS voice and semantic QA
+      - name: Create memory-safe scene voice pipeline
         if: steps.job.outputs.has_job == 'true'
-        env:
-          JOB_ID: ${{ steps.job.outputs.job_id }}
         run: |
-          cat > work/render.py <<'PY'
+          cat > work/voice_pipeline.py <<'PY'
+          import argparse
+          import gc
           import hashlib
           import json
+          import os
           import random
           import re
+          import sys
           import unicodedata
+          import wave
           from difflib import SequenceMatcher
           from pathlib import Path
-
-          import numpy as np
-          import torch
-          import torchaudio as ta
-          from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-          from faster_whisper import WhisperModel
 
           MAX_CHARS = 260
           INTER_CHUNK_SILENCE = 0.18
           INTER_SCENE_SILENCE = 0.18
           SEMANTIC_THRESHOLD = 0.55
+          MAX_ATTEMPTS = 3
+
           STOPWORDS = {
               'della','delle','degli','dello','dalla','dalle','dagli','dallo','alla','alle','agli','allo',
               'nella','nelle','negli','nello','sulla','sulle','sugli','sullo','anche','come','sono','solo',
@@ -102,13 +114,28 @@ jobs:
               'con','che','per','tra','fra','una','uno','gli','dei','del','dal','nel','sul','piu','non'
           }
 
-          def set_seed(seed):
-              torch.manual_seed(seed)
-              if torch.cuda.is_available():
-                  torch.cuda.manual_seed(seed)
-                  torch.cuda.manual_seed_all(seed)
-              random.seed(seed)
-              np.random.seed(seed)
+          WORK = Path("work")
+          CANDIDATES = WORK / "candidates"
+          OUTPUT = Path("voice_output")
+          CANDIDATES.mkdir(parents=True, exist_ok=True)
+          OUTPUT.mkdir(parents=True, exist_ok=True)
+
+          def load_job():
+              with open(WORK / "job.json", encoding="utf-8") as f:
+                  return json.load(f)
+
+          def scene_texts(job):
+              texts = job.get("scene_voice_texts")
+              if texts is None:
+                  scene_objects = job.get("scenes") or []
+                  if scene_objects and all(isinstance(s, dict) and s.get("voice_text") for s in scene_objects):
+                      texts = [s["voice_text"] for s in scene_objects]
+              if not texts:
+                  texts = [job.get("text", "")]
+              texts = [" ".join(str(x).split()) for x in texts]
+              if any(not x for x in texts):
+                  raise RuntimeError("Empty scene narration segment.")
+              return texts
 
           def split_text(text, max_chars=MAX_CHARS):
               text = " ".join(text.split())
@@ -137,7 +164,25 @@ jobs:
                   chunks.append(current)
               return chunks
 
+          def normalize_numbers(text):
+              try:
+                  from num2words import num2words
+              except Exception:
+                  return text
+
+              def repl(match):
+                  token = match.group(0)
+                  try:
+                      # Keep very long identifiers as identifiers rather than words.
+                      if len(token) > 9:
+                          return token
+                      return num2words(int(token), lang='it')
+                  except Exception:
+                      return token
+              return re.sub(r'\b\d+\b', repl, text)
+
           def normalize(text):
+              text = normalize_numbers(text)
               text = unicodedata.normalize('NFKD', text.lower())
               text = ''.join(c for c in text if not unicodedata.combining(c))
               text = re.sub(r'[^a-z0-9]+', ' ', text)
@@ -153,147 +198,310 @@ jobs:
               token_recall = (len(e_tokens & t_tokens) / len(e_tokens)) if e_tokens else char_ratio
               return 0.70 * char_ratio + 0.30 * token_recall
 
-          with open("work/job.json", encoding="utf-8") as f:
-              job = json.load(f)
+          def read_failed(default_all=False):
+              p = WORK / "failed_scenes.json"
+              if p.exists():
+                  return json.loads(p.read_text(encoding="utf-8"))
+              if default_all:
+                  return list(range(1, len(scene_texts(load_job())) + 1))
+              return []
 
-          job_id = job["job_id"]
-          candidate_id = job.get("candidate_id")
-          language_id = job.get("language_id", "it")
-          seed = int(job.get("seed", 271828))
-          exaggeration = float(job.get("exaggeration", 0.5))
-          cfg_weight = float(job.get("cfg_weight", 0.5))
-          temperature = float(job.get("temperature", 0.8))
+          def read_selected():
+              p = WORK / "selected.json"
+              if not p.exists():
+                  return {}
+              return json.loads(p.read_text(encoding="utf-8"))
 
-          scene_texts = job.get("scene_voice_texts")
-          if scene_texts is None:
-              scene_objects = job.get("scenes") or []
-              if scene_objects and all(isinstance(s, dict) and s.get("voice_text") for s in scene_objects):
-                  scene_texts = [s["voice_text"] for s in scene_objects]
-          if not scene_texts:
-              scene_texts = [job.get("text", "")]
-          scene_texts = [" ".join(str(x).split()) for x in scene_texts]
-          if any(not x for x in scene_texts):
-              raise RuntimeError("Empty scene narration segment.")
+          def write_selected(data):
+              (WORK / "selected.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-          device = "cuda" if torch.cuda.is_available() else "cpu"
-          print("Device:", device)
-          print("Loading Chatterbox Multilingual...")
-          tts = ChatterboxMultilingualTTS.from_pretrained(device=device)
-          print("Loading semantic speech verifier...")
-          asr = WhisperModel("small", compute_type="int8")
+          def set_seed(seed):
+              import numpy as np
+              import torch
+              torch.manual_seed(seed)
+              if torch.cuda.is_available():
+                  torch.cuda.manual_seed(seed)
+                  torch.cuda.manual_seed_all(seed)
+              random.seed(seed)
+              np.random.seed(seed)
 
-          segment_dir = Path("work/segments")
-          segment_dir.mkdir(parents=True, exist_ok=True)
-          output_dir = Path("voice_output")
-          output_dir.mkdir(parents=True, exist_ok=True)
+          def render(attempt):
+              # Heavy process A: Chatterbox only. Process exits after rendering,
+              # so OS reclaims model RAM before Whisper is started.
+              import torch
+              import torchaudio as ta
+              from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
-          scene_wavs = []
-          manifest_scenes = []
-          cumulative = 0.0
+              job = load_job()
+              texts = scene_texts(job)
+              targets = list(range(1, len(texts) + 1)) if attempt == 0 else read_failed()
+              if not targets:
+                  print("RENDER_NOOP no failed scenes")
+                  return
 
-          def synthesize_scene(scene_index, text, attempt):
-              chunks = split_text(text)
-              if not chunks:
-                  raise RuntimeError(f"Empty TTS chunks for scene {scene_index}.")
-              rendered = []
-              for chunk_index, chunk in enumerate(chunks):
-                  chunk_seed = seed + scene_index * 100 + chunk_index + attempt * 10000
-                  set_seed(chunk_seed)
-                  wav = tts.generate(
-                      chunk,
-                      language_id=language_id,
-                      exaggeration=exaggeration,
-                      cfg_weight=cfg_weight,
-                      temperature=temperature
+              language_id = job.get("language_id", "it")
+              seed = int(job.get("seed", 271828))
+              exaggeration = float(job.get("exaggeration", 0.5))
+              cfg_weight = float(job.get("cfg_weight", 0.5))
+              temperature = float(job.get("temperature", 0.8))
+              device = "cuda" if torch.cuda.is_available() else "cpu"
+
+              print(f"RENDER_START attempt={attempt + 1} scenes={targets} device={device}")
+              tts = ChatterboxMultilingualTTS.from_pretrained(device=device)
+
+              for scene_index in targets:
+                  text = texts[scene_index - 1]
+                  chunks = split_text(text)
+                  rendered = []
+                  for chunk_index, chunk in enumerate(chunks):
+                      chunk_seed = seed + scene_index * 100 + chunk_index + attempt * 10000
+                      set_seed(chunk_seed)
+                      wav = tts.generate(
+                          chunk,
+                          language_id=language_id,
+                          exaggeration=exaggeration,
+                          cfg_weight=cfg_weight,
+                          temperature=temperature
+                      )
+                      rendered.append(wav)
+                      if chunk_index < len(chunks) - 1:
+                          silence_samples = int(tts.sr * INTER_CHUNK_SILENCE)
+                          rendered.append(torch.zeros((1, silence_samples), dtype=wav.dtype, device=wav.device))
+
+                  scene_wav = torch.cat(rendered, dim=1)
+                  path = CANDIDATES / f"scene_{scene_index:02d}_attempt_{attempt}.wav"
+                  ta.save(str(path), scene_wav.cpu(), tts.sr, encoding="PCM_S", bits_per_sample=16)
+                  meta = {
+                      "scene_index": scene_index,
+                      "attempt": attempt,
+                      "chunk_count": len(chunks),
+                      "sample_rate_hz": int(tts.sr),
+                      "path": str(path)
+                  }
+                  (CANDIDATES / f"scene_{scene_index:02d}_attempt_{attempt}.json").write_text(
+                      json.dumps(meta, indent=2), encoding="utf-8"
                   )
-                  rendered.append(wav)
-                  if chunk_index < len(chunks) - 1:
-                      silence_samples = int(tts.sr * INTER_CHUNK_SILENCE)
-                      rendered.append(torch.zeros((1, silence_samples), dtype=wav.dtype, device=wav.device))
-              scene_wav = torch.cat(rendered, dim=1)
-              path = segment_dir / f"scene_{scene_index:02d}_attempt_{attempt}.wav"
-              ta.save(str(path), scene_wav.cpu(), tts.sr)
-              return scene_wav, path, chunks
+                  print(f"RENDERED scene={scene_index} attempt={attempt + 1} chunks={len(chunks)}")
 
-          for i, text in enumerate(scene_texts, start=1):
-              accepted = None
-              last = None
-              for attempt in (0, 1, 2):
-                  print(f"Rendering scene {i}/{len(scene_texts)} attempt {attempt + 1}")
-                  wav, path, chunks = synthesize_scene(i, text, attempt)
-                  segments, _ = asr.transcribe(str(path), language=language_id, beam_size=5, vad_filter=False, condition_on_previous_text=False)
+              del tts
+              gc.collect()
+              print("RENDER_PROCESS_COMPLETE")
+
+          def verify(attempt, final=False):
+              # Heavy process B: Whisper only. Chatterbox is not imported here.
+              from faster_whisper import WhisperModel
+
+              job = load_job()
+              texts = scene_texts(job)
+              targets = list(range(1, len(texts) + 1)) if attempt == 0 else read_failed()
+              selected = read_selected()
+
+              if not targets:
+                  (WORK / "failed_scenes.json").write_text("[]", encoding="utf-8")
+                  print("VERIFY_NOOP no failed scenes")
+                  return
+
+              print(f"VERIFY_START attempt={attempt + 1} scenes={targets}")
+              # Base is sufficient as a semantic sentinel and substantially lighter
+              # than small. It runs alone in this process.
+              asr = WhisperModel("base", device="cpu", compute_type="int8")
+              failed = []
+
+              for scene_index in targets:
+                  path = CANDIDATES / f"scene_{scene_index:02d}_attempt_{attempt}.wav"
+                  if not path.exists():
+                      failed.append(scene_index)
+                      print(f"SEMANTIC_AUDIO_QA scene={scene_index} attempt={attempt + 1} score=0.000 missing_audio=true")
+                      continue
+
+                  segments, _ = asr.transcribe(
+                      str(path),
+                      language=job.get("language_id", "it"),
+                      beam_size=3,
+                      vad_filter=False,
+                      condition_on_previous_text=False
+                  )
                   transcript = " ".join(seg.text.strip() for seg in segments).strip()
-                  score = semantic_score(text, transcript)
-                  print(f"SEMANTIC_AUDIO_QA scene={i} attempt={attempt + 1} score={score:.3f}")
-                  last = (wav, chunks, transcript, score, attempt)
+                  score = semantic_score(texts[scene_index - 1], transcript)
+                  print(f"SEMANTIC_AUDIO_QA scene={scene_index} attempt={attempt + 1} score={score:.3f} transcript={transcript[:160]!r}")
+
                   if score >= SEMANTIC_THRESHOLD:
-                      accepted = last
-                      break
-              if accepted is None:
-                  _, _, transcript, score, _ = last
-                  raise RuntimeError(f"SEMANTIC_AUDIO_QA_FAIL scene={i} score={score:.3f} transcript={transcript[:220]!r}")
+                      meta = json.loads((CANDIDATES / f"scene_{scene_index:02d}_attempt_{attempt}.json").read_text(encoding="utf-8"))
+                      selected[str(scene_index)] = {
+                          "scene_index": scene_index,
+                          "attempt": attempt,
+                          "retry_count": attempt,
+                          "path": str(path),
+                          "chunk_count": meta["chunk_count"],
+                          "semantic_score": round(score, 4),
+                          "transcript": transcript
+                      }
+                  else:
+                      failed.append(scene_index)
 
-              wav, chunks, transcript, score, attempt = accepted
-              raw_duration = wav.shape[1] / tts.sr
-              boundary_duration = raw_duration + (INTER_SCENE_SILENCE if i < len(scene_texts) else 0.0)
-              start = cumulative
-              cumulative += boundary_duration
-              scene_wavs.append(wav)
+              write_selected(selected)
+              (WORK / "failed_scenes.json").write_text(json.dumps(failed), encoding="utf-8")
+              print(f"VERIFY_COMPLETE attempt={attempt + 1} failed={failed}")
 
-              if i < len(scene_texts):
-                  silence_samples = int(tts.sr * INTER_SCENE_SILENCE)
-                  scene_wavs.append(torch.zeros((1, silence_samples), dtype=wav.dtype, device=wav.device))
+              if final and failed:
+                  raise RuntimeError(f"SEMANTIC_AUDIO_QA_FAIL after {MAX_ATTEMPTS} isolated attempts; scenes={failed}")
 
-              manifest_scenes.append({
-                  "scene_index": i,
-                  "expected_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                  "chunk_count": len(chunks),
-                  "semantic_score": round(score, 4),
-                  "semantic_qa": "PASS",
-                  "retry_count": attempt,
-                  "raw_scene_audio_seconds": round(raw_duration, 6),
-                  "boundary_start_seconds": round(start, 6),
-                  "boundary_end_seconds": round(cumulative, 6)
-              })
+          def has_failed():
+              failed = read_failed()
+              print("true" if failed else "false")
 
-          final_wav = torch.cat(scene_wavs, dim=1)
-          output = output_dir / f"{job_id}.wav"
-          ta.save(str(output), final_wav.cpu(), tts.sr)
+          def assemble():
+              job = load_job()
+              texts = scene_texts(job)
+              selected = read_selected()
+              missing = [i for i in range(1, len(texts) + 1) if str(i) not in selected]
+              if missing:
+                  raise RuntimeError(f"Cannot assemble: no accepted audio for scenes {missing}")
 
-          if not output.exists() or output.stat().st_size == 0:
-              raise RuntimeError("No valid WAV generated.")
+              job_id = job["job_id"]
+              candidate_id = job.get("candidate_id")
+              output_wav = OUTPUT / f"{job_id}.wav"
+              manifest_scenes = []
+              boundaries = [0.0]
+              cumulative_frames = 0
 
-          actual_duration = final_wav.shape[1] / tts.sr
-          manifest = {
-              "schema_version": "DecisionOS Scene-Locked Voice Manifest v1",
-              "job_id": job_id,
-              "candidate_id": candidate_id,
-              "scene_locked": len(scene_texts) > 1,
-              "scene_count": len(scene_texts),
-              "sample_rate_hz": tts.sr,
-              "raw_audio_duration_seconds": round(actual_duration, 6),
-              "scene_boundaries": [0.0] + [s["boundary_end_seconds"] for s in manifest_scenes],
-              "semantic_audio_qa": "PASS",
-              "semantic_threshold": SEMANTIC_THRESHOLD,
-              "scenes": manifest_scenes
-          }
+              first = selected["1"]["path"]
+              with wave.open(first, "rb") as w:
+                  channels = w.getnchannels()
+                  sampwidth = w.getsampwidth()
+                  framerate = w.getframerate()
+                  comptype = w.getcomptype()
+              if comptype != "NONE":
+                  raise RuntimeError("Expected uncompressed PCM WAV.")
 
-          with open(output_dir / f"{job_id}_manifest.json", "w", encoding="utf-8") as f:
-              json.dump(manifest, f, ensure_ascii=False, indent=2)
+              with wave.open(str(output_wav), "wb") as out:
+                  out.setnchannels(channels)
+                  out.setsampwidth(sampwidth)
+                  out.setframerate(framerate)
 
-          print("VOICE_RENDER_PASS:", output)
-          print("SCENE_LOCKED_VOICE_PASS", len(scene_texts), actual_duration)
-          print("SEMANTIC_AUDIO_QA_PASS")
+                  for i in range(1, len(texts) + 1):
+                      item = selected[str(i)]
+                      with wave.open(item["path"], "rb") as src:
+                          if (src.getnchannels(), src.getsampwidth(), src.getframerate(), src.getcomptype()) != (channels, sampwidth, framerate, "NONE"):
+                              raise RuntimeError(f"WAV format mismatch at scene {i}")
+                          frames = src.readframes(src.getnframes())
+                          nframes = src.getnframes()
+
+                      start_seconds = cumulative_frames / framerate
+                      out.writeframes(frames)
+                      cumulative_frames += nframes
+                      raw_duration = nframes / framerate
+
+                      if i < len(texts):
+                          silence_frames = int(round(framerate * INTER_SCENE_SILENCE))
+                          out.writeframes(b"\x00" * silence_frames * channels * sampwidth)
+                          cumulative_frames += silence_frames
+
+                      end_seconds = cumulative_frames / framerate
+                      boundaries.append(round(end_seconds, 6))
+                      manifest_scenes.append({
+                          "scene_index": i,
+                          "expected_text_sha256": hashlib.sha256(texts[i - 1].encode("utf-8")).hexdigest(),
+                          "chunk_count": item["chunk_count"],
+                          "semantic_score": item["semantic_score"],
+                          "semantic_qa": "PASS",
+                          "retry_count": item["retry_count"],
+                          "raw_scene_audio_seconds": round(raw_duration, 6),
+                          "boundary_start_seconds": round(start_seconds, 6),
+                          "boundary_end_seconds": round(end_seconds, 6)
+                      })
+
+              actual_duration = cumulative_frames / framerate
+              manifest = {
+                  "schema_version": "DecisionOS Scene-Locked Voice Manifest v1",
+                  "job_id": job_id,
+                  "candidate_id": candidate_id,
+                  "scene_locked": len(texts) > 1,
+                  "scene_count": len(texts),
+                  "sample_rate_hz": framerate,
+                  "raw_audio_duration_seconds": round(actual_duration, 6),
+                  "scene_boundaries": boundaries,
+                  "semantic_audio_qa": "PASS",
+                  "semantic_threshold": SEMANTIC_THRESHOLD,
+                  "verification_model": "faster-whisper/base int8 isolated-process",
+                  "scenes": manifest_scenes
+              }
+
+              manifest_path = OUTPUT / f"{job_id}_manifest.json"
+              manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+              print(f"VOICE_RENDER_PASS {output_wav}")
+              print(f"SCENE_LOCKED_VOICE_PASS scenes={len(texts)} duration={actual_duration:.3f}")
+              print("SEMANTIC_AUDIO_QA_PASS")
+
+          parser = argparse.ArgumentParser()
+          sub = parser.add_subparsers(dest="command", required=True)
+          r = sub.add_parser("render")
+          r.add_argument("--attempt", type=int, required=True)
+          v = sub.add_parser("verify")
+          v.add_argument("--attempt", type=int, required=True)
+          v.add_argument("--final", action="store_true")
+          sub.add_parser("has-failed")
+          sub.add_parser("assemble")
+          args = parser.parse_args()
+
+          if args.command == "render":
+              render(args.attempt)
+          elif args.command == "verify":
+              verify(args.attempt, final=args.final)
+          elif args.command == "has-failed":
+              has_failed()
+          elif args.command == "assemble":
+              assemble()
           PY
 
-          python work/render.py
+      # Attempt 1: render -> process exits -> Whisper verify starts in fresh process.
+      - name: Render voice scenes — attempt 1
+        if: steps.job.outputs.has_job == 'true'
+        run: python work/voice_pipeline.py render --attempt 0
+
+      - name: Semantic QA — attempt 1
+        if: steps.job.outputs.has_job == 'true'
+        id: verify0
+        shell: bash
+        run: |
+          set -euo pipefail
+          python work/voice_pipeline.py verify --attempt 0
+          HAS_FAILED=$(python work/voice_pipeline.py has-failed | tail -n 1)
+          echo "has_failed=$HAS_FAILED" >> "$GITHUB_OUTPUT"
+
+      # Retry only the failed scenes. Chatterbox and Whisper still never coexist.
+      - name: Render failed scenes — attempt 2
+        if: steps.job.outputs.has_job == 'true' && steps.verify0.outputs.has_failed == 'true'
+        run: python work/voice_pipeline.py render --attempt 1
+
+      - name: Semantic QA — attempt 2
+        if: steps.job.outputs.has_job == 'true' && steps.verify0.outputs.has_failed == 'true'
+        id: verify1
+        shell: bash
+        run: |
+          set -euo pipefail
+          python work/voice_pipeline.py verify --attempt 1
+          HAS_FAILED=$(python work/voice_pipeline.py has-failed | tail -n 1)
+          echo "has_failed=$HAS_FAILED" >> "$GITHUB_OUTPUT"
+
+      - name: Render failed scenes — attempt 3
+        if: steps.job.outputs.has_job == 'true' && steps.verify0.outputs.has_failed == 'true' && steps.verify1.outputs.has_failed == 'true'
+        run: python work/voice_pipeline.py render --attempt 2
+
+      - name: Semantic QA — attempt 3 final
+        if: steps.job.outputs.has_job == 'true' && steps.verify0.outputs.has_failed == 'true' && steps.verify1.outputs.has_failed == 'true'
+        run: python work/voice_pipeline.py verify --attempt 2 --final
+
+      - name: Assemble accepted scenes and exact timing manifest
+        if: steps.job.outputs.has_job == 'true'
+        run: python work/voice_pipeline.py assemble
 
       - name: Technical audio QA
         if: steps.job.outputs.has_job == 'true'
         run: |
+          set -euo pipefail
           WAV_FILE=$(find voice_output -maxdepth 1 -type f -name '*.wav' | head -n 1)
           MANIFEST=$(find voice_output -maxdepth 1 -type f -name '*_manifest.json' | head -n 1)
-
           test -n "$WAV_FILE"
           test -s "$WAV_FILE"
           test -n "$MANIFEST"
@@ -314,6 +522,7 @@ jobs:
           assert manifest["scene_count"] >= 1
           assert len(manifest["scene_boundaries"]) == manifest["scene_count"] + 1
           assert all(b > a for a, b in zip(manifest["scene_boundaries"], manifest["scene_boundaries"][1:]))
+          assert all(s["semantic_qa"] == "PASS" for s in manifest["scenes"])
           print("VOICE_MANIFEST_QA_PASS", manifest["scene_count"], manifest["raw_audio_duration_seconds"])
           PY
 
