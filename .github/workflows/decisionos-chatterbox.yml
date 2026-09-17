@@ -180,7 +180,7 @@ jobs:
           print("Loading Chatterbox Multilingual...")
           tts = ChatterboxMultilingualTTS.from_pretrained(device=device)
           print("Loading semantic speech verifier...")
-          asr = WhisperModel("base", device="cpu", compute_type="int8")
+          asr = WhisperModel("small", compute_type="int8")
 
           segment_dir = Path("work/segments")
           segment_dir.mkdir(parents=True, exist_ok=True)
@@ -218,10 +218,10 @@ jobs:
           for i, text in enumerate(scene_texts, start=1):
               accepted = None
               last = None
-              for attempt in (0, 1):
+              for attempt in (0, 1, 2):
                   print(f"Rendering scene {i}/{len(scene_texts)} attempt {attempt + 1}")
                   wav, path, chunks = synthesize_scene(i, text, attempt)
-                  segments, _ = asr.transcribe(str(path), language=language_id, beam_size=3, vad_filter=False)
+                  segments, _ = asr.transcribe(str(path), language=language_id, beam_size=5, vad_filter=False, condition_on_previous_text=False)
                   transcript = " ".join(seg.text.strip() for seg in segments).strip()
                   score = semantic_score(text, transcript)
                   print(f"SEMANTIC_AUDIO_QA scene={i} attempt={attempt + 1} score={score:.3f}")
