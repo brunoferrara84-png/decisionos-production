@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 # Never let two scheduled polls render the same mailbox concurrently.
 concurrency:
@@ -67,14 +68,61 @@ jobs:
           echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
           echo "DecisionOS voice job: $JOB_ID"
 
-      - name: Set up Python
+      - name: Skip already processed DecisionOS voice job
+        id: guard
         if: steps.job.outputs.has_job == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          JOB_ID="${{ steps.job.outputs.job_id }}"
+          SUCCESS_NAME="DecisionOS-Voice-${JOB_ID}"
+          TERMINAL_NAME="DecisionOS-Voice-Terminal-${JOB_ID}"
+
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100&name=${SUCCESS_NAME}" \
+            -o work/success_artifacts.json
+
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100&name=${TERMINAL_NAME}" \
+            -o work/terminal_artifacts.json
+
+          SUCCESS_COUNT=$(python3 -c 'import json; print(json.load(open("work/success_artifacts.json")).get("total_count", 0))')
+          TERMINAL_COUNT=$(python3 -c 'import json; print(json.load(open("work/terminal_artifacts.json")).get("total_count", 0))')
+
+          if [ "$SUCCESS_COUNT" -gt 0 ]; then
+            echo "JOB_ALREADY_PROCESSED_SUCCESS $JOB_ID"
+            echo "should_render=false" >> "$GITHUB_OUTPUT"
+            echo "terminal_state=SUCCESS" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$TERMINAL_COUNT" -gt 0 ]; then
+            echo "JOB_ALREADY_PROCESSED_TERMINAL_FAILURE $JOB_ID"
+            echo "should_render=false" >> "$GITHUB_OUTPUT"
+            echo "terminal_state=SEMANTIC_QA_FAIL" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_render=true" >> "$GITHUB_OUTPUT"
+          echo "terminal_state=NONE" >> "$GITHUB_OUTPUT"
+          echo "VOICE_JOB_RENDER_AUTHORIZED $JOB_ID"
+
+      - name: Set up Python
+        if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install voice dependencies
-        if: steps.job.outputs.has_job == 'true'
+        if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true'
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -85,7 +133,7 @@ jobs:
           pip install chatterbox-tts faster-whisper num2words
 
       - name: Create memory-safe scene voice pipeline
-        if: steps.job.outputs.has_job == 'true'
+        if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true'
         run: |
           cat > work/voice_pipeline.py <<'PY'
           import argparse
@@ -456,11 +504,11 @@ jobs:
 
       # Attempt 1: render -> process exits -> Whisper verify starts in fresh process.
       - name: Render voice scenes — attempt 1
-        if: steps.job.outputs.has_job == 'true'
+        if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true'
         run: python work/voice_pipeline.py render --attempt 0
 
       - name: Semantic QA — attempt 1
-        if: steps.job.outputs.has_job == 'true'
+        if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true'
         id: verify0
         shell: bash
         run: |
@@ -471,11 +519,11 @@ jobs:
 
       # Retry only the failed scenes. Chatterbox and Whisper still never coexist.
       - name: Render failed scenes — attempt 2
-        if: steps.job.outputs.has_job == 'true' && steps.verify0.outputs.has_failed == 'true'
+        if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true' && steps.verify0.outputs.has_failed == 'true'
         run: python work/voice_pipeline.py render --attempt 1
 
       - name: Semantic QA — attempt 2
-        if: steps.job.outputs.has_job == 'true' && steps.verify0.outputs.has_failed == 'true'
+        if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true' && steps.verify0.outputs.has_failed == 'true'
         id: verify1
         shell: bash
         run: |
@@ -485,19 +533,69 @@ jobs:
           echo "has_failed=$HAS_FAILED" >> "$GITHUB_OUTPUT"
 
       - name: Render failed scenes — attempt 3
-        if: steps.job.outputs.has_job == 'true' && steps.verify0.outputs.has_failed == 'true' && steps.verify1.outputs.has_failed == 'true'
+        if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true' && steps.verify0.outputs.has_failed == 'true' && steps.verify1.outputs.has_failed == 'true'
         run: python work/voice_pipeline.py render --attempt 2
 
       - name: Semantic QA — attempt 3 final
-        if: steps.job.outputs.has_job == 'true' && steps.verify0.outputs.has_failed == 'true' && steps.verify1.outputs.has_failed == 'true'
-        run: python work/voice_pipeline.py verify --attempt 2 --final
+        if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true' && steps.verify0.outputs.has_failed == 'true' && steps.verify1.outputs.has_failed == 'true'
+        id: verify2
+        shell: bash
+        run: |
+          set -euo pipefail
+          python work/voice_pipeline.py verify --attempt 2
+          HAS_FAILED=$(python work/voice_pipeline.py has-failed | tail -n 1)
+          echo "has_failed=$HAS_FAILED" >> "$GITHUB_OUTPUT"
+
+      - name: Determine final semantic state
+        if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true'
+        id: semantic_state
+        shell: bash
+        run: |
+          set -euo pipefail
+          HAS_FAILED=$(python work/voice_pipeline.py has-failed | tail -n 1)
+          echo "has_failed=$HAS_FAILED" >> "$GITHUB_OUTPUT"
+          echo "FINAL_SEMANTIC_STATE failed=$HAS_FAILED"
+
+      - name: Create terminal semantic failure marker
+        if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true' && steps.semantic_state.outputs.has_failed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          job = json.load(open("work/job.json", encoding="utf-8"))
+          failed = json.load(open("work/failed_scenes.json", encoding="utf-8"))
+          marker = {
+              "schema_version": "DecisionOS Voice Terminal Marker v1",
+              "job_id": job["job_id"],
+              "candidate_id": job.get("candidate_id"),
+              "terminal_result": "SEMANTIC_QA_FAIL",
+              "failed_scenes": failed,
+              "bounded_attempts": 3,
+              "publication_authorized": False
+          }
+          out = Path("voice_output") / f'{job["job_id"]}_terminal_failure.json'
+          out.write_text(json.dumps(marker, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("VOICE_TERMINAL_SEMANTIC_FAILURE_HANDLED", job["job_id"], failed)
+          PY
+
+      - name: Upload terminal semantic failure marker
+        if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true' && steps.semantic_state.outputs.has_failed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DecisionOS-Voice-Terminal-${{ steps.job.outputs.job_id }}
+          path: voice_output/*_terminal_failure.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Assemble accepted scenes and exact timing manifest
-        if: steps.job.outputs.has_job == 'true'
+        if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true' && steps.semantic_state.outputs.has_failed == 'false'
         run: python work/voice_pipeline.py assemble
 
       - name: Technical audio QA
-        if: steps.job.outputs.has_job == 'true'
+        if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true' && steps.semantic_state.outputs.has_failed == 'false'
         run: |
           set -euo pipefail
           WAV_FILE=$(find voice_output -maxdepth 1 -type f -name '*.wav' | head -n 1)
@@ -527,7 +625,7 @@ jobs:
           PY
 
       - name: Upload DecisionOS voice artifact
-        if: steps.job.outputs.has_job == 'true'
+        if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true' && steps.semantic_state.outputs.has_failed == 'false'
         uses: actions/upload-artifact@v4
         with:
           name: DecisionOS-Voice-${{ steps.job.outputs.job_id }}
