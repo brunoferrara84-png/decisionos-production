@@ -94,6 +94,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p work output rendered/scenes
           MASTER="decisionos_assets/decisionos_logo_master.png"
           test -s "$MASTER"
           cp "$MASTER" work/decisionos_logo_master.png
