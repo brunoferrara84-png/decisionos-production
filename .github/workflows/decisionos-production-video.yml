@@ -79,6 +79,8 @@ jobs:
       - name: Checkout production assets
         if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true'
         uses: actions/checkout@v4
+        with:
+            clean: false
 
       - name: Install production dependencies
         if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true'
