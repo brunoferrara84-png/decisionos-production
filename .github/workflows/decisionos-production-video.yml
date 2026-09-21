@@ -80,7 +80,7 @@ jobs:
         if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true'
         uses: actions/checkout@v4
         with:
-            clean: false
+            path: repo
 
       - name: Install production dependencies
         if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true'
@@ -97,7 +97,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work output rendered/scenes
-          MASTER="decisionos_assets/decisionos_logo_master.png"
+          MASTER="repo/decisionos_assets/decisionos_logo_master.png"
           test -s "$MASTER"
           cp "$MASTER" work/decisionos_logo_master.png
           ACTUAL_SHA=$(sha256sum work/decisionos_logo_master.png | awk '{print $1}')
