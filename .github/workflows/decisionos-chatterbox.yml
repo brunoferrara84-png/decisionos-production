@@ -299,7 +299,7 @@ jobs:
 
               for scene_index in targets:
                   text = texts[scene_index - 1]
-                  chunks = split_text(text)
+                  chunks = split_text(text, max_chars=(260, 120, 80)[min(attempt, 2)])
                   rendered = []
                   for chunk_index, chunk in enumerate(chunks):
                       chunk_seed = seed + scene_index * 100 + chunk_index + attempt * 10000
