@@ -26,8 +26,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work voice_output
-          URL="https://res.cloudinary.com/uhdjssyk/raw/upload/decisionos/m010_4/voice_job_latest"
-          HTTP_CODE=$(curl --silent --show-error --location --output work/job.json --write-out "%{http_code}" "${URL}?nocache=$(date +%s)")
+          # DECISIONOS_VOICE_WORKER_V2_3 — version-path cache bust prevents stale RAW singleton delivery.
+          CACHE_BUST_VERSION="$(date +%s)"
+          URL="https://res.cloudinary.com/uhdjssyk/raw/upload/v${CACHE_BUST_VERSION}/decisionos/m010_4/voice_job_latest"
+          HTTP_CODE=$(curl --silent --show-error --location --output work/job.json --write-out "%{http_code}" "${URL}")
           if [ "$HTTP_CODE" != "200" ]; then
             echo "No active DecisionOS voice job."
             echo "has_job=false" >> "$GITHUB_OUTPUT"
@@ -64,9 +66,14 @@ jobs:
             exit 0
           fi
 
+          CANDIDATE_ID=$(python -c 'import json; print(json.load(open("work/job.json", encoding="utf-8")).get("candidate_id", ""))')
+          INTEGRITY=$(python -c 'import json; j=json.load(open("work/job.json", encoding="utf-8")); print(j.get("voice_job_integrity_sha256") or j.get("integrity_sha256") or "")')
           echo "has_job=true" >> "$GITHUB_OUTPUT"
           echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
+          echo "candidate_id=$CANDIDATE_ID" >> "$GITHUB_OUTPUT"
+          echo "integrity_sha256=$INTEGRITY" >> "$GITHUB_OUTPUT"
           echo "DecisionOS voice job: $JOB_ID"
+          echo "VOICE_CONSUMER_RECEIPT candidate_id=$CANDIDATE_ID voice_job_id=$JOB_ID voice_job_integrity_sha256=$INTEGRITY"
 
       - name: Skip already processed DecisionOS voice job
         id: guard
@@ -125,13 +132,13 @@ jobs:
         if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true'
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          python -m pip install --upgrade pip
-          # Chatterbox and Whisper are invoked in DIFFERENT Python processes.
-          # They are never resident in RAM at the same time.
-          pip install chatterbox-tts faster-whisper num2words
-
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          # Versions frozen from successful Bango R002 execution on 2026-09-28.
+          # Chatterbox and Whisper remain in different Python processes for memory safety.
+          pip install chatterbox-tts==0.1.7 faster-whisper==1.2.1 num2words==0.5.14
       - name: Create memory-safe scene voice pipeline
         if: steps.job.outputs.has_job == 'true' && steps.guard.outputs.should_render == 'true'
         run: |
