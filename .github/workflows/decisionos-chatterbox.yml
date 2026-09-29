@@ -225,6 +225,23 @@ jobs:
               except Exception:
                   return text
 
+              # Canonicalize common written-vs-spoken numeric forms before ASR scoring.
+              text = re.sub(r'(?<!\w)\+(?=\d)', ' piu ', text)
+              text = re.sub(r'(?<!\w)-(?=\d)', ' meno ', text)
+              text = re.sub(r'(?<=\d)[,.](?=\d)', ' virgola ', text)
+              text = text.replace('%', ' percento ')
+
+              def repl(match):
+                  token = match.group(0)
+                  try:
+                      # Keep very long identifiers as identifiers rather than words.
+                      if len(token) > 9:
+                          return token
+                      return num2words(int(token), lang='it')
+                  except Exception:
+                      return token
+              return re.sub(r'\b\d+\b', repl, text)
+
               def repl(match):
                   token = match.group(0)
                   try:
