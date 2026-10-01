@@ -56,16 +56,45 @@ jobs:
               )
               print(f"JOB_JSON_SANITIZED original_error={exc}", file=sys.stderr)
 
-          print(job.get("job_id", ""))
+          job_id = job.get("job_id")
+          voice_job_id = job.get("voice_job_id")
+
+          if job_id and voice_job_id and job_id != voice_job_id:
+              print(
+                  f"QUEUE_SCHEMA_IDENTITY_MISMATCH job_id={job_id} voice_job_id={voice_job_id}",
+                  file=sys.stderr,
+              )
+              raise SystemExit(42)
+
+          resolved_job_id = job_id or voice_job_id or ""
+          if resolved_job_id:
+              normalized = False
+              if job.get("job_id") != resolved_job_id:
+                  job["job_id"] = resolved_job_id
+                  normalized = True
+              if job.get("voice_job_id") != resolved_job_id:
+                  job["voice_job_id"] = resolved_job_id
+                  normalized = True
+              if normalized:
+                  path.write_text(
+                      json.dumps(job, ensure_ascii=False, separators=(",", ":")),
+                      encoding="utf-8",
+                  )
+                  print(
+                      f"QUEUE_SCHEMA_ALIAS_NORMALIZED job_id={resolved_job_id}",
+                      file=sys.stderr,
+                  )
+
+          print(resolved_job_id)
           PY
           )
 
           if [ -z "$JOB_ID" ]; then
-            echo "No valid DecisionOS job_id."
+            echo "No valid DecisionOS job_id or voice_job_id."
             echo "has_job=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
+          
           CANDIDATE_ID=$(python -c 'import json; print(json.load(open("work/job.json", encoding="utf-8")).get("candidate_id", ""))')
           INTEGRITY=$(python -c 'import json; j=json.load(open("work/job.json", encoding="utf-8")); print(j.get("voice_job_integrity_sha256") or j.get("integrity_sha256") or "")')
           echo "has_job=true" >> "$GITHUB_OUTPUT"
